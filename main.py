@@ -8,6 +8,7 @@ from google.adk.agents import Agent, SequentialAgent, LlmAgent
 from google.adk.sessions import InMemorySessionService
 from google.adk.runners import Runner
 from google.genai import types
+from google.adk.models.lite_llm import LiteLlm
 
 
 # configの読み込み
@@ -19,8 +20,8 @@ BOT_NAME = config["discord_bot_name"]
 TARGET_USER_ID = int(config["target_user_id"])
 TARGET_CHANNEL_ID = int(config["target_channel_id"])
 
-os.environ["GOOGLE_API_KEY"] = config["gemini_api_key"]
-os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "False"
+#os.environ["GOOGLE_API_KEY"] = config["gemini_api_key"]
+#os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "False"
 
 
 intents = discord.Intents.default()
@@ -66,17 +67,25 @@ SECRETARY_C2U_INSTRUCTION = """
 投稿は１回だけにしてください。
 """
 
-u2c_agent = LlmAgent(
-    name="chat_secretary_v1",
-    model=config["model_gemini"],
+u2c_agent = Agent(
+    model=LiteLlm(
+        model=config["model"],
+        api_base=config["localllmaddr"],
+        api_key=config["api_key"],
+    ),
+    name="chat_u2c_secretary_v1",
     description="chatでの会話内容について、ユーザの発言を、内容の公正さや丁重さを高めた上で指定のchannelへ投稿を行います。",
     instruction=SECRETARY_U2C_INSTRUCTION,
     tools=[channelPost, privateMessage],
 )
 
-c2u_agent = LlmAgent(
-    name="chat_secretary_v1",
-    model=config["model_gemini"],
+c2u_agent = Agent(
+    model=LiteLlm(
+        model=config["model"],
+        api_base=config["localllmaddr"],
+        api_key=config["api_key"],
+    ),
+    name="chat_c2u_secretary_v1",
     description="chatでの会話内容について、channel上の議論のうち、取り次ぐべき内容を判断し、ユーザへ要約して伝えます。",
     instruction=SECRETARY_C2U_INSTRUCTION,
     tools=[channelPost, privateMessage],
@@ -123,8 +132,9 @@ async def on_message(message):
   
             full_text = []
             async for event in runner.run_async(user_id=user, session_id=session.id, new_message=user_msg):
-### af af after
                 calls = event.get_function_calls()
+                print("calls")
+                print(calls)
                 if calls:
                     for i, c in enumerate(calls, 1):
                         fname = getattr(c, "name", None) or getattr(c, "function", None)
@@ -137,6 +147,8 @@ async def on_message(message):
                                 fname = getattr(r, "name", None) or getattr(r, "function", None)
                                 out   = (getattr(r, "response", None) or getattr(r, "output", None) or getattr(r, "result", None))
                                 print(f"RET [{i}]: {fname} -> {out}")
+
+                        break
   
                 t = event_text(event)
                 if not t:
@@ -178,7 +190,6 @@ async def on_message(message):
    
                 full_text = []
                 async for event in runner.run_async(user_id=user, session_id=session.id, new_message=user_msg):
-#### af af af after
                     calls = event.get_function_calls()
                     if calls:
                         for i, c in enumerate(calls, 1):
@@ -192,6 +203,8 @@ async def on_message(message):
                                     fname = getattr(r, "name", None) or getattr(r, "function", None)
                                     out   = (getattr(r, "response", None) or getattr(r, "output", None) or getattr(r, "result", None))
                                     print(f"RET [{i}]: {fname} -> {out}")
+
+                            break
    
                     t = event_text(event)
                     if not t:
