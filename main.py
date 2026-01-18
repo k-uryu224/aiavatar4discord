@@ -55,7 +55,7 @@ async def prepare_user_message(app: str, user_id: str, new_content: str):
     session_key = (app, user_id)
     history = SESSION_MEMORY.get(session_key, [])
 
-    # 最新10件だけ残す
+    # 最新100件だけ残す
     history_text = "\n".join(history[-100:]) if history else ""
 
     # 新しい発言を追加
