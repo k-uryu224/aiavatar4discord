@@ -48,6 +48,38 @@ async def privateMessage(text: str) -> str:
     await user.send(text)
 
     return
+# ユーザID単位で履歴管理
+SESSION_MEMORY = {}  # { (app, user_id): [発言1, 発言2, ...] }
+
+async def prepare_user_message(app: str, user_id: str, new_content: str):
+    session_key = (app, user_id)
+    history = SESSION_MEMORY.get(session_key, [])
+
+    # 最新10件だけ残す
+    history_text = "\n".join(history[-100:]) if history else ""
+
+    # 新しい発言を追加
+    history.append(new_content)
+    SESSION_MEMORY[session_key] = history
+
+    # Contentオブジェクトにまとめて渡す
+    full_text = history_text + "\n" + new_content if history_text else new_content
+    return types.Content(role="user", parts=[types.Part(text=full_text)])
+
+# ========================
+# Session管理
+# ========================
+SESSION_SERVICE = InMemorySessionService()
+SESSIONS = {}
+
+def get_session(app: str, user: str, sid: str):
+    key = (app, user, sid)
+    if key not in SESSIONS:
+        # 新規session作成をasync taskとして保存
+        SESSIONS[key] = asyncio.create_task(
+            SESSION_SERVICE.create_session(app_name=app, user_id=user, session_id=sid)
+        )
+    return SESSIONS[key]
 
 # 会話Agent
 SECRETARY_U2C_INSTRUCTION = """
@@ -66,7 +98,12 @@ SECRETARY_C2U_INSTRUCTION = """
 返事を自分でする場合はchannelPostを必ず使ってください。
 投稿は１回だけにしてください。
 """
-
+# 矛盾チェック用Agent
+CONTRADICTION_INSTRUCTION = """
+あなたは過去の発言履歴を確認し、新しい発言に矛盾や不一致がある場合、
+できるだけ厳しく指摘してください。
+矛盾点は明確に、簡潔に列挙してください。
+"""
 u2c_agent = Agent(
     model=LiteLlm(
         model=config["model"],
@@ -90,7 +127,18 @@ c2u_agent = Agent(
     instruction=SECRETARY_C2U_INSTRUCTION,
     tools=[channelPost, privateMessage],
 )
-
+# 矛盾チェック用Agent
+contradiction_agent = Agent(
+    model=LiteLlm(
+        model=config["model"],
+        api_base=config["localllmaddr"],
+        api_key=config["api_key"],
+    ),
+    name="contradiction_checker_v1",
+    description="過去の発言履歴と新しい発言を比較し、矛盾点を厳しく指摘します。",
+    instruction=CONTRADICTION_INSTRUCTION,
+    tools=[channelPost, privateMessage],
+)
 def event_text(ev) -> str:
    if getattr(ev, "content", None) and getattr(ev.content, "parts", None):
        # partsの中に text があるものだけ連結
@@ -102,6 +150,43 @@ def is_final(ev) -> bool:
      attr = getattr(ev, "is_final_response", None)
      return attr() if callable(attr) else bool(attr)  # メソッド/プロパティどちらにも対応
 
+ # 矛盾チェック
+async def check_contradictions(app: str, user: str, new_content: str, dm: bool = True) -> bool:
+    """
+    矛盾があったら True を返す。無ければ False。
+    """
+    session_key = (app, user)
+    history = SESSION_MEMORY.get(session_key, [])
+    if not history:
+        return False  # 履歴なしなら矛盾なし
+
+    # 過去最新10件 + 新しい発言を渡す 
+    history_text = "\n".join(history[-10:]) 
+    prompt_text = "過去の発言履歴:\n" + history_text 
+    prompt_text += "\n新しい発言:\n" + new_content
+
+    session_id = f"contradiction_{user}"
+    session_task = get_session(app, user, session_id)
+    session = await session_task
+
+    runner = Runner(agent=contradiction_agent, app_name=app, session_service=SESSION_SERVICE)
+    user_msg = types.Content(role="user", parts=[types.Part(text=prompt_text)])
+
+    async for event in runner.run_async(user_id=user, session_id=session.id, new_message=user_msg):
+        t = event_text(event)
+        if t and is_final(event):
+            t = t.strip()
+            if not t:
+                return False  # 矛盾なし
+            if dm:
+                await privateMessage(f"⚠️ 矛盾チェック結果:\n{t}")
+            else:
+                await channelPost(f"⚠️ 矛盾チェック結果:\n{t}")
+            return True  # 矛盾あり
+
+    return False  # 矛盾なし
+
+
 @bot.event
 async def on_ready():
     print(f"Connected to Discord!")
@@ -111,57 +196,57 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
+    if message.author.id == bot.user.id:
+        return
+    app = "SynologyChatAgentApp"
+    user = str(message.author.id)   # ← ここでユーザIDを文字列化
+    sid = str(getattr(message.channel, "id", "DM"))  # DMかチャンネルIDで区別
 
     # 自分からBOTへのDMの処理
     if isinstance(message.channel, discord.DMChannel):
         if message.author.id == TARGET_USER_ID:
             print(f"[DM1] from {message.author.name} -> {message.content}")
+            has_contradiction = await check_contradictions(app, user, message.content, dm=True)
+            if not has_contradiction:
+                # CHANNELにメッセージを投稿
+                session = await get_session(app, user, sid)
+                runner = Runner(agent=u2c_agent, app_name=app, session_service=SESSION_SERVICE)
+            
+                # 過去履歴を反映した Content を作成
+                user_msg = await prepare_user_message(app, user, message.content)
+                full_text = []
+                async for event in runner.run_async(user_id=user, session_id=session.id, new_message=user_msg):
+                    calls = event.get_function_calls()
+                    print("calls")
+                    print(calls)
+                    if calls:
+                        for i, c in enumerate(calls, 1):
+                            fname = getattr(c, "name", None) or getattr(c, "function", None)
+                            fargs = getattr(c, "arguments", None) or getattr(c, "args", None)
+                            print(f"CALL[{i}]: {fname}({fargs})")
+  
+                            rets = event.get_function_responses()
+                            if rets:
+                                for i, r in enumerate(rets, 1):
+                                    fname = getattr(r, "name", None) or getattr(r, "function", None)
+                                    out   = (getattr(r, "response", None) or getattr(r, "output", None) or getattr(r, "result", None))
+                                    print(f"RET [{i}]: {fname} -> {out}")
 
-            # CHANNELにメッセージを投稿
-            session_service = InMemorySessionService()
-            app, user, sid = "SynologyChatAgentApp", "user_1", "sess_001"
-            session = await session_service.create_session(app_name=app, user_id=user, session_id=sid)
+                            break
   
-            runner = Runner(agent=u2c_agent, app_name=app, session_service=session_service)
+                    t = event_text(event)
+                    if not t:
+                        continue
   
-            # 最初のユーザ入力（必要なら）
-            user_msg = types.Content(
-                role="user",
-                parts=[types.Part(text=message.content)]
-            )
+                    # ストリーミング途中か最終かで蓄積
+                    if getattr(event, "partial", False):
+                        full_text.append(t)
+                    elif is_final(event):
+                        full_text.append(t)
   
-            full_text = []
-            async for event in runner.run_async(user_id=user, session_id=session.id, new_message=user_msg):
-                calls = event.get_function_calls()
-                print("calls")
-                print(calls)
-                if calls:
-                    for i, c in enumerate(calls, 1):
-                        fname = getattr(c, "name", None) or getattr(c, "function", None)
-                        fargs = getattr(c, "arguments", None) or getattr(c, "args", None)
-                        print(f"CALL[{i}]: {fname}({fargs})")
-  
-                        rets = event.get_function_responses()
-                        if rets:
-                            for i, r in enumerate(rets, 1):
-                                fname = getattr(r, "name", None) or getattr(r, "function", None)
-                                out   = (getattr(r, "response", None) or getattr(r, "output", None) or getattr(r, "result", None))
-                                print(f"RET [{i}]: {fname} -> {out}")
-
-                        break
-  
-                t = event_text(event)
-                if not t:
-                    continue
-  
-                # ストリーミング途中か最終かで蓄積
-                if getattr(event, "partial", False):
-                    full_text.append(t)
-                elif is_final(event):
-                    full_text.append(t)
-  
-            print("--- FINAL ---")
-            print("".join(full_text))
+                print("--- FINAL ---")
+                print("".join(full_text))
+              
 
 #            channel = bot.get_channel(TARGET_CHANNEL_ID)
 #            await channel.send(f"[DM1] from {message.author.name} -> {message.content}")
@@ -176,18 +261,11 @@ async def on_message(message):
             else:
                 print(f"[CHANNEL] from {message.author.name} -> {message.content}")
                 # USERにDMを送信
-                session_service = InMemorySessionService()
-                app, user, sid = "SynologyChatAgentApp", "user_1", "sess_001"
-                session = await session_service.create_session(app_name=app, user_id=user, session_id=sid)
+                session = await get_session(app, user, sid)
+                runner = Runner(agent=c2u_agent, app_name=app, session_service=SESSION_SERVICE)
    
-                runner = Runner(agent=c2u_agent, app_name=app, session_service=session_service)
-   
-                # 最初のユーザ入力（必要なら）
-                user_msg = types.Content(
-                    role="user",
-                    parts=[types.Part(text=message.content)]
-                )
-   
+                user_msg = await prepare_user_message(app, user,message.content)
+                await check_contradictions(app, user, message.content, dm=False)
                 full_text = []
                 async for event in runner.run_async(user_id=user, session_id=session.id, new_message=user_msg):
                     calls = event.get_function_calls()

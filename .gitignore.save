@@ -7,9 +7,6 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv/
-_pycache_/
+.venv
 
-# Configs and secrets
 config.yml
-*.pyc
